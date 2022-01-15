@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.5.17;
+pragma solidity 0.5.17;
 pragma experimental ABIEncoderV2;
 import './byn.sol';
 import './Ownable.sol';
+import './ReentrancyGuard.sol';
 
-contract BeyondStaking is Ownable {
+contract BeyondStaking is ReentrancyGuard, Ownable {
     using SafeMath for uint256;
     uint256 public _decimals;
     uint256 public _packageCount;
@@ -20,6 +21,10 @@ contract BeyondStaking is Ownable {
     event Deposit(address a, uint256 amount, uint256 idPackage);
     event Withdraw(address a, uint256 amountDeposit, uint256 amountReceive, uint256 idPackage);
     event Claim(address a, uint256 amountClaim, uint256 timeClaim);
+    event ChangeEarlyFeePercentage(address a, uint256 percent);
+    event AddPackage(address a, uint256 duration, uint256 percentage, bool active);
+    event DeactivePackage(address a, uint256 idPackage);
+    event OwnerWithdrawAll(address a);
 
     struct PackageStaking {
         uint256 duration;
@@ -48,15 +53,16 @@ contract BeyondStaking is Ownable {
         addPackage(120,2502530802063640,true);
     }
 
-    function changeEarlyFeePercentage(uint256 percent)  onlyOwner public {
+    function changeEarlyFeePercentage(uint256 percent)  onlyOwner external {
         earlyFeePercentage = percent;
+        emit ChangeEarlyFeePercentage(msg.sender, percent);
     }
 
-    function packageInfo(uint256 idPackage) public view returns (PackageStaking memory) {
+    function packageInfo(uint256 idPackage) external view returns (PackageStaking memory) {
         return packages[idPackage];        
     }
 
-    function listPackage() public view returns (PackageStaking[] memory ) {
+    function listPackage() external view returns (PackageStaking[] memory ) {
         PackageStaking[] memory data = new PackageStaking[](_packageCount);
         for(uint i=0; i<_packageCount;i++){
             data[i]=(packages[i]);
@@ -68,17 +74,19 @@ contract BeyondStaking is Ownable {
 
     function addPackage(uint256 duration, uint256 percentage, bool active) onlyOwner public {
         packages[_packageCount++]= PackageStaking(duration.mul(86400), percentage, active);
+        emit AddPackage(msg.sender, duration, percentage, active);
     }
 
-    function deactivePackage(uint256 idPackage) onlyOwner public {
-        require(idPackage< _packageCount);
+    function deactivePackage(uint256 idPackage) onlyOwner external {
+        require(idPackage< _packageCount, "package not found");
         require(packages[idPackage].active== true,"no need deactive");
         packages[idPackage].active= false;        
+        emit DeactivePackage(msg.sender, idPackage);
     }
 
-    function deposit(uint256 amount, uint256 packageId) public {
+    function deposit(uint256 amount, uint256 packageId) external {
         require(!_doStaking(msg.sender),"Cannot restaking ");
-        require(packageId < _packageCount && packages[packageId].duration >0 || packages[packageId].active == true, "Can't find package or packages is off" );
+        require(packageId < _packageCount && packages[packageId].duration >0 && packages[packageId].active == true, "Can't find package or packages is off" );
         require(amount>0,"amount invalid");
         require(bynToken.balanceOf(msg.sender) >= amount, "you account not have money");
         bynToken.transferFrom(msg.sender, address(this), amount);
@@ -88,45 +96,31 @@ contract BeyondStaking is Ownable {
         emit Deposit(msg.sender, amount, packageId);
     }
 
-    function withdraw() public {
+    function withdraw() external nonReentrant {
         require(_doStaking(msg.sender),"You not staking");
-        require(stakingInfo[msg.sender].lastTimeUnstake > 0, "You need to unstake instead");
-        require((stakingInfo[msg.sender].lastTimeUnstake + 600) <= block.timestamp, "Cannot withdraw before 5 days after unstaked" );
+        require(stakingInfo[msg.sender].isUnstake == true, "You need to unstake instead");
+        require((stakingInfo[msg.sender].lastTimeUnstake + 5 * 86400) <= block.timestamp, "Cannot withdraw before 5 days after unstaked" );
         (uint256 amountReward, , ) = _calculatorClaim(msg.sender);
-        uint256 total=0;
-        if(block.timestamp >= stakingInfo[msg.sender].expireTime){
-            total = amountReward.add(stakingInfo[msg.sender].amountDeposit);
-            require(bynToken.balanceOf(address(this)) >= total, "Smartcontract not enough money");
-            bynToken.transfer(msg.sender, total);
-        }else{
-            total = amountReward.add(stakingInfo[msg.sender].amountDeposit);
-            total= total.sub(amountReward.mul(earlyFeePercentage).div(10**_decimals));
-            require(bynToken.balanceOf(address(this)) >= total, "Smartcontract not enough money");
-            bynToken.transfer(msg.sender, total);
+        uint256 total = amountReward.add(stakingInfo[msg.sender].amountDeposit);
+        if(block.timestamp < stakingInfo[msg.sender].expireTime){
+            total= total.sub(amountReward.mul(earlyFeePercentage).div(10**_decimals));           
         }
+        require(bynToken.balanceOf(address(this)) >= total, "Smartcontract not enough money");
         totalStackingAmount=totalStackingAmount.sub(stakingInfo[msg.sender].amountDeposit);
+        delete stakingInfo[msg.sender];
+        bynToken.transfer(msg.sender, total);
         emit Withdraw(msg.sender, stakingInfo[msg.sender].amountDeposit, total, stakingInfo[msg.sender].packageId);
-        _clear(msg.sender);
     }
 
-    function unstake() public {
+    function unstake() external {
         require(stakingInfo[msg.sender].isUnstake == false, "You can not unstake");
         stakingInfo[msg.sender].lastTimeUnstake = block.timestamp;
         stakingInfo[msg.sender].isUnstake = true;
     }
 
-    function _clear(address a) internal {
-        stakingInfo[a].amountDeposit = 0;
-        stakingInfo[a].registerTime = 0;
-        stakingInfo[a].lastTimeClaim = 0;
-        stakingInfo[a].packageId = 0;
-        stakingInfo[a].expireTime = 0;
-        stakingInfo[a].lastTimeUnstake = 0;
-        stakingInfo[a].isUnstake = false;
-    }
-
-    function ownerWithdrawAll() onlyOwner public {
+    function ownerWithdrawAll() onlyOwner external {
         bynToken.transfer(owner(), bynToken.balanceOf(address(this)));
+        emit OwnerWithdrawAll(msg.sender);
     }
 
     function _calculatorClaim(address a) internal view returns (uint256 amountReward, uint256 totalDivideReward,uint256 timeDivide){
@@ -141,8 +135,7 @@ contract BeyondStaking is Ownable {
         } else {
             currentTimeReward = block.timestamp >= info.lastTimeUnstake ? info.lastTimeUnstake: block.timestamp;
         }
-        
-        
+              
         if(currentTimeReward.sub(info.lastTimeClaim)>=timeDivide){
             totalDivideReward = currentTimeReward.sub(info.lastTimeClaim).div(timeDivide);
             uint256 amount =info.amountDeposit ;
@@ -157,7 +150,7 @@ contract BeyondStaking is Ownable {
 
     }
 
-    function stakingInfoOf(address a) public view  returns (uint256 amountDeposit,
+    function stakingInfoOf(address a) external view  returns (uint256 amountDeposit,
         uint256 registerTime,
         uint256 lastTimeClaim,
         uint256 expireTime,
@@ -177,7 +170,7 @@ contract BeyondStaking is Ownable {
         );
     }
 
-    function calculatorClaim(address a) public view  returns (uint256 amountReward,uint256 totalDivideReward,uint256 timeDivide) {
+    function calculatorClaim(address a) external view  returns (uint256 amountReward,uint256 totalDivideReward,uint256 timeDivide) {
         return _calculatorClaim(a);
     }
 
@@ -186,7 +179,7 @@ contract BeyondStaking is Ownable {
         return  info.amountDeposit!=0  ;
     }
 
-    function doStakingOf(address a) public view returns (bool doStaking) {
+    function doStakingOf(address a) external view returns (bool doStaking) {
         return _doStaking(a);
     }
 
